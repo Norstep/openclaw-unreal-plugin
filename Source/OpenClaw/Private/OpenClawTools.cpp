@@ -26,6 +26,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Serialization/JsonSerializer.h"
 #include "HAL/PlatformFilemanager.h"
+#include "UObject/UnrealType.h"
 
 TSharedPtr<FJsonObject> FOpenClawTools::ExecuteTool(const FString& ToolName, const TSharedPtr<FJsonObject>& Params)
 {
@@ -43,6 +44,7 @@ TSharedPtr<FJsonObject> FOpenClawTools::ExecuteTool(const FString& ToolName, con
 	if (ToolName == TEXT("actor.delete") || ToolName == TEXT("actor.destroy")) return Actor_Delete(Params);
 	if (ToolName == TEXT("actor.getData")) return Actor_GetData(Params);
 	if (ToolName == TEXT("actor.setProperty")) return Actor_SetProperty(Params);
+	if (ToolName == TEXT("actor.callFunction")) return Actor_CallFunction(Params);
 	
 	if (ToolName == TEXT("transform.getPosition")) return Transform_GetPosition(Params);
 	if (ToolName == TEXT("transform.setPosition")) return Transform_SetPosition(Params);
@@ -84,8 +86,8 @@ TSharedPtr<FJsonObject> FOpenClawTools::ExecuteTool(const FString& ToolName, con
 int32 FOpenClawTools::GetToolCount()
 {
 	// Count of all available tools
-	// Level: 4, Actor: 6, Transform: 6, Component: 3, Editor: 5, Debug: 3, Input: 3, Asset: 2, Console: 2, Blueprint: 2
-	return 36;
+	// Level: 4, Actor: 7, Transform: 6, Component: 3, Editor: 5, Debug: 3, Input: 3, Asset: 2, Console: 2, Blueprint: 2
+	return 37;
 }
 
 // Helper functions
@@ -407,14 +409,43 @@ TSharedPtr<FJsonObject> FOpenClawTools::Actor_Create(const TSharedPtr<FJsonObjec
 	}
 	else
 	{
-		// Default to StaticMeshActor with cube (ensures RootComponent exists)
-		NewActor = World->SpawnActor<AStaticMeshActor>(Location, FRotator::ZeroRotator);
-		if (AStaticMeshActor* SMAActor = Cast<AStaticMeshActor>(NewActor))
+		// Try dynamic class resolution before falling back
+		UClass* DynamicClass = nullptr;
+
+		// Handle Blueprint asset paths (/Game/...) - need _C suffix for Blueprint class
+		FString ClassPath = Type;
+		if (ClassPath.StartsWith(TEXT("/Game/")) && !ClassPath.EndsWith(TEXT("_C")))
 		{
-			UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
-			if (CubeMesh && SMAActor->GetStaticMeshComponent())
+			ClassPath += TEXT("_C");
+		}
+
+		DynamicClass = LoadClass<AActor>(nullptr, *ClassPath);
+
+		if (!DynamicClass)
+		{
+			// Try as a script/native class path (/Script/ModuleName.ClassName)
+			DynamicClass = FindObject<UClass>(nullptr, *ClassPath);
+		}
+
+		if (DynamicClass && DynamicClass->IsChildOf<AActor>())
+		{
+			FActorSpawnParameters SpawnParams;
+			SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+			NewActor = World->SpawnActor<AActor>(DynamicClass, Location, FRotator::ZeroRotator, SpawnParams);
+		}
+
+		if (!NewActor)
+		{
+			// Final fallback: static mesh cube
+			UE_LOG(LogOpenClaw, Warning, TEXT("actor.create: Could not resolve class '%s', falling back to StaticMeshActor"), *Type);
+			NewActor = World->SpawnActor<AStaticMeshActor>(Location, FRotator::ZeroRotator);
+			if (AStaticMeshActor* SMAActor = Cast<AStaticMeshActor>(NewActor))
 			{
-				SMAActor->GetStaticMeshComponent()->SetStaticMesh(CubeMesh);
+				UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+				if (CubeMesh && SMAActor->GetStaticMeshComponent())
+				{
+					SMAActor->GetStaticMeshComponent()->SetStaticMesh(CubeMesh);
+				}
 			}
 		}
 	}
@@ -545,6 +576,181 @@ TSharedPtr<FJsonObject> FOpenClawTools::Actor_SetProperty(const TSharedPtr<FJson
 	}
 	
 	return MakeErrorResult(FString::Printf(TEXT("Failed to set property %s to %s"), *Property, *Value));
+}
+
+TSharedPtr<FJsonObject> FOpenClawTools::Actor_CallFunction(const TSharedPtr<FJsonObject>& Params)
+{
+	// Resolve actor and function names
+	FString ActorName = Params->HasField(TEXT("actor")) ? Params->GetStringField(TEXT("actor")) : Params->GetStringField(TEXT("name"));
+	FString FunctionName = Params->GetStringField(TEXT("function"));
+	FString ComponentName = Params->HasField(TEXT("component")) ? Params->GetStringField(TEXT("component")) : TEXT("");
+
+	if (ActorName.IsEmpty())
+	{
+		return MakeErrorResult(TEXT("actor is required"));
+	}
+	if (FunctionName.IsEmpty())
+	{
+		return MakeErrorResult(TEXT("function is required"));
+	}
+
+	// Search editor world first, then PIE play world if active
+	AActor* Actor = FindActorByName(ActorName);
+	if (!Actor && GEditor && GEditor->PlayWorld)
+	{
+		for (TActorIterator<AActor> It(GEditor->PlayWorld); It; ++It)
+		{
+			if ((*It)->GetName() == ActorName || (*It)->GetActorLabel() == ActorName)
+			{
+				Actor = *It;
+				break;
+			}
+		}
+	}
+
+	if (!Actor)
+	{
+		return MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), *ActorName));
+	}
+
+	// Resolve target object: actor itself, or a named component
+	UObject* TargetObject = Actor;
+	if (!ComponentName.IsEmpty())
+	{
+		UObject* FoundComp = nullptr;
+		for (UActorComponent* Comp : Actor->GetComponents())
+		{
+			if (Comp && (Comp->GetName().Contains(ComponentName) || Comp->GetClass()->GetName().Contains(ComponentName)))
+			{
+				FoundComp = Comp;
+				break;
+			}
+		}
+		if (!FoundComp)
+		{
+			return MakeErrorResult(FString::Printf(TEXT("Component not found on actor '%s': %s"), *ActorName, *ComponentName));
+		}
+		TargetObject = FoundComp;
+	}
+
+	// Find the UFunction via reflection
+	UFunction* Func = TargetObject->FindFunction(FName(*FunctionName));
+	if (!Func)
+	{
+		return MakeErrorResult(FString::Printf(TEXT("Function not found: %s"), *FunctionName));
+	}
+
+	// Security guard: only allow Blueprint-callable functions
+	if (!(Func->FunctionFlags & FUNC_BlueprintCallable))
+	{
+		return MakeErrorResult(FString::Printf(TEXT("Function '%s' is not Blueprint-callable and cannot be called via MCP"), *FunctionName));
+	}
+
+	// Allocate and zero-initialize parameter memory
+	TArray<uint8> Parms;
+	Parms.SetNumZeroed(Func->ParmsSize);
+
+	// Fill input parameters from JSON
+	const TSharedPtr<FJsonObject>* JsonParams = nullptr;
+	if (Params->TryGetObjectField(TEXT("params"), JsonParams) && JsonParams && (*JsonParams).IsValid())
+	{
+		for (TFieldIterator<FProperty> It(Func); It && (It->PropertyFlags & CPF_Parm); ++It)
+		{
+			FProperty* Prop = *It;
+
+			// Skip return and output-only params
+			if (Prop->PropertyFlags & CPF_ReturnParm)
+			{
+				continue;
+			}
+
+			FString PropName = Prop->GetName();
+			if (!(*JsonParams)->HasField(PropName))
+			{
+				continue;
+			}
+
+			void* PropAddr = Prop->ContainerPtrToValuePtr<void>(Parms.GetData());
+
+			if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+			{
+				FloatProp->SetPropertyValue(PropAddr, (float)(*JsonParams)->GetNumberField(PropName));
+			}
+			else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+			{
+				DoubleProp->SetPropertyValue(PropAddr, (*JsonParams)->GetNumberField(PropName));
+			}
+			else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
+			{
+				IntProp->SetPropertyValue(PropAddr, FMath::RoundToInt32((float)(*JsonParams)->GetNumberField(PropName)));
+			}
+			else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+			{
+				BoolProp->SetPropertyValue(PropAddr, (*JsonParams)->GetBoolField(PropName));
+			}
+			else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+			{
+				StrProp->SetPropertyValue(PropAddr, (*JsonParams)->GetStringField(PropName));
+			}
+			else if (FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+			{
+				NameProp->SetPropertyValue(PropAddr, FName(*(*JsonParams)->GetStringField(PropName)));
+			}
+			else
+			{
+				UE_LOG(LogOpenClaw, Warning, TEXT("actor.callFunction: Unsupported param type for '%s' — left zero-initialized"), *PropName);
+			}
+		}
+	}
+
+	// Invoke the function
+	TargetObject->ProcessEvent(Func, Parms.GetData());
+
+	// Build result
+	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("actor"), Actor->GetName());
+	Result->SetStringField(TEXT("function"), FunctionName);
+	if (!ComponentName.IsEmpty())
+	{
+		Result->SetStringField(TEXT("component"), ComponentName);
+	}
+
+	// Read return value if the function has one
+	for (TFieldIterator<FProperty> It(Func); It && (It->PropertyFlags & CPF_Parm); ++It)
+	{
+		FProperty* Prop = *It;
+		if (!(Prop->PropertyFlags & CPF_ReturnParm))
+		{
+			continue;
+		}
+
+		void* PropAddr = Prop->ContainerPtrToValuePtr<void>(Parms.GetData());
+
+		if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+		{
+			Result->SetNumberField(TEXT("returnValue"), FloatProp->GetPropertyValue(PropAddr));
+		}
+		else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+		{
+			Result->SetNumberField(TEXT("returnValue"), DoubleProp->GetPropertyValue(PropAddr));
+		}
+		else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
+		{
+			Result->SetNumberField(TEXT("returnValue"), IntProp->GetPropertyValue(PropAddr));
+		}
+		else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+		{
+			Result->SetBoolField(TEXT("returnValue"), BoolProp->GetPropertyValue(PropAddr));
+		}
+		else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+		{
+			Result->SetStringField(TEXT("returnValue"), StrProp->GetPropertyValue(PropAddr));
+		}
+		break;
+	}
+
+	return Result;
 }
 
 // Transform tools

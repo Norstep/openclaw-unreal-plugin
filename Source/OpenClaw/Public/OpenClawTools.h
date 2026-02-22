@@ -32,6 +32,7 @@ private:
 	static TSharedPtr<FJsonObject> Actor_Delete(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonObject> Actor_GetData(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonObject> Actor_SetProperty(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonObject> Actor_CallFunction(const TSharedPtr<FJsonObject>& Params);
 	
 	// Transform tools
 	static TSharedPtr<FJsonObject> Transform_GetPosition(const TSharedPtr<FJsonObject>& Params);
