@@ -17,6 +17,36 @@ DEFINE_LOG_CATEGORY(LogOpenClaw);
 
 FOpenClawConnectionManager* FOpenClawConnectionManager::Instance = nullptr;
 
+static FString ResolveHomeDir()
+{
+	FString HomeDir = FPlatformMisc::GetEnvironmentVariable(TEXT("HOME"));
+	if (HomeDir.IsEmpty())
+	{
+		HomeDir = FPlatformMisc::GetEnvironmentVariable(TEXT("USERPROFILE"));
+	}
+	return HomeDir;
+}
+
+static void ApplyGatewayAuthHeaders(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Request, const FString& Secret)
+{
+	if (Secret.IsEmpty())
+	{
+		UE_LOG(LogOpenClaw, Warning, TEXT("Gateway auth secret is empty; request will likely be rejected."));
+		return;
+	}
+
+	if (Secret.StartsWith(TEXT("Bearer ")))
+	{
+		Request->SetHeader(TEXT("Authorization"), Secret);
+	}
+	else
+	{
+		Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *Secret));
+	}
+
+	UE_LOG(LogOpenClaw, Verbose, TEXT("Applied gateway auth header."));
+}
+
 FOpenClawConnectionManager::FOpenClawConnectionManager()
 	: GatewayHost(TEXT("127.0.0.1"))
 	, GatewayPort(18789)  // OpenClaw Gateway default port
@@ -70,7 +100,11 @@ void FOpenClawConnectionManager::LoadConfig()
 	// Fall back to user home directory
 	if (!FPaths::FileExists(ConfigPath))
 	{
-		ConfigPath = FPlatformMisc::GetEnvironmentVariable(TEXT("HOME")) / TEXT(".openclaw") / TEXT("unreal-plugin.json");
+		const FString HomeDir = ResolveHomeDir();
+		if (!HomeDir.IsEmpty())
+		{
+			ConfigPath = HomeDir / TEXT(".openclaw") / TEXT("unreal-plugin.json");
+		}
 	}
 	
 	if (FPaths::FileExists(ConfigPath))
@@ -108,7 +142,33 @@ void FOpenClawConnectionManager::LoadConfig()
 	{
 		UE_LOG(LogOpenClaw, Log, TEXT("Using default config (Gateway: %s:%d)"), *GatewayHost, GatewayPort);
 	}
+
+	// Environment fallbacks (useful on systems where no config file is present)
+	if (PluginSecret.IsEmpty())
+	{
+		PluginSecret = FPlatformMisc::GetEnvironmentVariable(TEXT("OPENCLAW_GATEWAY_TOKEN"));
+	}
+	if (PluginSecret.IsEmpty())
+	{
+		PluginSecret = FPlatformMisc::GetEnvironmentVariable(TEXT("OPENCLAW_GATEWAY_PASSWORD"));
+	}
+
+	if (GatewayHost.IsEmpty())
+	{
+		const FString EnvHost = FPlatformMisc::GetEnvironmentVariable(TEXT("OPENCLAW_GATEWAY_HOST"));
+		if (!EnvHost.IsEmpty())
+		{
+			GatewayHost = EnvHost;
+		}
+	}
+
+	const FString EnvPort = FPlatformMisc::GetEnvironmentVariable(TEXT("OPENCLAW_GATEWAY_PORT"));
+	if (!EnvPort.IsEmpty())
+	{
+		GatewayPort = FCString::Atoi(*EnvPort);
+	}
 }
+
 
 void FOpenClawConnectionManager::Connect()
 {
@@ -145,6 +205,7 @@ void FOpenClawConnectionManager::SendRegister()
 	Request->SetURL(BuildUrl(TEXT("/unreal/register")));
 	Request->SetVerb(TEXT("POST"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	ApplyGatewayAuthHeaders(Request, PluginSecret);
 	
 	// Get project name from project settings
 	FString ProjectName = FApp::GetProjectName();
@@ -206,6 +267,14 @@ void FOpenClawConnectionManager::HandleRegisterResponse(FHttpRequestPtr Request,
 	else
 	{
 		UE_LOG(LogOpenClaw, Warning, TEXT("Registration failed with code: %d"), ResponseCode);
+		if (Response.IsValid())
+		{
+			const FString ResponseBody = Response->GetContentAsString();
+			if (!ResponseBody.IsEmpty())
+			{
+				UE_LOG(LogOpenClaw, Warning, TEXT("Register response body: %s"), *ResponseBody);
+			}
+		}
 		SetState(EOpenClawConnectionState::Error);
 	}
 }
@@ -283,6 +352,7 @@ void FOpenClawConnectionManager::Poll()
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
 	Request->SetURL(BuildUrl(FString::Printf(TEXT("/unreal/poll?sessionId=%s"), *SessionId)));
 	Request->SetVerb(TEXT("GET"));
+	ApplyGatewayAuthHeaders(Request, PluginSecret);
 	Request->OnProcessRequestComplete().BindRaw(this, &FOpenClawConnectionManager::HandlePollResponse);
 	Request->ProcessRequest();
 }
@@ -349,6 +419,7 @@ void FOpenClawConnectionManager::SendHeartbeat()
 	Request->SetURL(BuildUrl(TEXT("/unreal/heartbeat")));
 	Request->SetVerb(TEXT("POST"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	ApplyGatewayAuthHeaders(Request, PluginSecret);
 	
 	TSharedPtr<FJsonObject> Body = MakeShareable(new FJsonObject());
 	Body->SetStringField(TEXT("sessionId"), SessionId);
@@ -407,6 +478,7 @@ void FOpenClawConnectionManager::SendToolResult(const FString& ToolCallId, const
 	Request->SetURL(BuildUrl(TEXT("/unreal/result")));
 	Request->SetVerb(TEXT("POST"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	ApplyGatewayAuthHeaders(Request, PluginSecret);
 	
 	TSharedPtr<FJsonObject> Body = MakeShareable(new FJsonObject());
 	Body->SetStringField(TEXT("sessionId"), SessionId);

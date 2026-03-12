@@ -1162,7 +1162,13 @@ TSharedPtr<FJsonObject> FOpenClawTools::Console_Execute(const TSharedPtr<FJsonOb
 	
 	if (GEngine)
 	{
-		GEngine->Exec(GetEditorWorld(), *Command);
+		UWorld* ExecWorld = (GEditor && GEditor->PlayWorld) ? GEditor->PlayWorld.Get() : GetEditorWorld();
+		if (!ExecWorld)
+		{
+			return MakeErrorResult(TEXT("No valid world for console execution"));
+		}
+
+		GEngine->Exec(ExecWorld, *Command);
 		return MakeSuccessResult(FString::Printf(TEXT("Executed: %s"), *Command));
 	}
 	
