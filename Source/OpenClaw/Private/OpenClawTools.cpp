@@ -23,10 +23,72 @@
 #include "HighResScreenshot.h"
 #include "ImageUtils.h"
 #include "Misc/FileHelper.h"
+#include "HAL/PlatformOutputDevices.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/FileManager.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Serialization/JsonSerializer.h"
 #include "HAL/PlatformFilemanager.h"
 #include "UObject/UnrealType.h"
+
+namespace
+{
+	UWorld* ResolveToolWorld(const TSharedPtr<FJsonObject>& Params, bool bPreferPlayWorld = true)
+	{
+		const FString RequestedWorld = Params.IsValid() && Params->HasField(TEXT("world"))
+			? Params->GetStringField(TEXT("world")).ToLower()
+			: TEXT("");
+
+		if (GEditor)
+		{
+			if (RequestedWorld == TEXT("play") || RequestedWorld == TEXT("pie") || RequestedWorld == TEXT("runtime"))
+			{
+				if (GEditor->PlayWorld)
+				{
+					return GEditor->PlayWorld.Get();
+				}
+			}
+			else if (RequestedWorld == TEXT("editor"))
+			{
+				if (UWorld* EditorWorld = GEditor->GetEditorWorldContext().World())
+				{
+					return EditorWorld;
+				}
+			}
+
+			if (bPreferPlayWorld && GEditor->PlayWorld)
+			{
+				return GEditor->PlayWorld.Get();
+			}
+
+			if (UWorld* EditorWorld = GEditor->GetEditorWorldContext().World())
+			{
+				return EditorWorld;
+			}
+		}
+
+		return nullptr;
+	}
+
+	AActor* FindActorByNameInWorld(UWorld* World, const FString& Name)
+	{
+		if (!World || Name.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			AActor* Actor = *It;
+			if (Actor && (Actor->GetName() == Name || Actor->GetActorLabel() == Name))
+			{
+				return Actor;
+			}
+		}
+
+		return nullptr;
+	}
+}
 
 TSharedPtr<FJsonObject> FOpenClawTools::ExecuteTool(const FString& ToolName, const TSharedPtr<FJsonObject>& Params)
 {
@@ -118,21 +180,24 @@ UWorld* FOpenClawTools::GetEditorWorld()
 
 AActor* FOpenClawTools::FindActorByName(const FString& Name)
 {
-	UWorld* World = GetEditorWorld();
-	if (!World)
+	if (Name.IsEmpty())
 	{
 		return nullptr;
 	}
-	
-	for (TActorIterator<AActor> It(World); It; ++It)
+
+	if (UWorld* PreferredWorld = ResolveToolWorld(nullptr, true))
 	{
-		AActor* Actor = *It;
-		if (Actor && (Actor->GetName() == Name || Actor->GetActorLabel() == Name))
+		if (AActor* Found = FindActorByNameInWorld(PreferredWorld, Name))
 		{
-			return Actor;
+			return Found;
 		}
 	}
-	
+
+	if (UWorld* EditorWorld = ResolveToolWorld(nullptr, false))
+	{
+		return FindActorByNameInWorld(EditorWorld, Name);
+	}
+
 	return nullptr;
 }
 
@@ -273,47 +338,89 @@ TSharedPtr<FJsonObject> FOpenClawTools::Level_Save(const TSharedPtr<FJsonObject>
 // Actor tools
 TSharedPtr<FJsonObject> FOpenClawTools::Actor_Find(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Name = Params->GetStringField(TEXT("name"));
-	
-	if (Name.IsEmpty())
+	const FString Name = Params->HasField(TEXT("name")) ? Params->GetStringField(TEXT("name")) : TEXT("");
+	const FString ClassFilter = Params->HasField(TEXT("class")) ? Params->GetStringField(TEXT("class")) : TEXT("");
+
+	if (Name.IsEmpty() && ClassFilter.IsEmpty())
 	{
-		return MakeErrorResult(TEXT("name is required"));
+		return MakeErrorResult(TEXT("name or class is required"));
 	}
-	
-	AActor* Actor = FindActorByName(Name);
-	if (!Actor)
+
+	UWorld* World = ResolveToolWorld(Params, true);
+	if (!World)
 	{
-		return MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), *Name));
+		return MakeErrorResult(TEXT("No world available"));
 	}
-	
+
+	AActor* FirstMatch = nullptr;
+	TArray<TSharedPtr<FJsonValue>> MatchesArray;
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor)
+		{
+			continue;
+		}
+
+		const bool bNameMatch = Name.IsEmpty() || Actor->GetName() == Name || Actor->GetActorLabel() == Name;
+		const bool bClassMatch = ClassFilter.IsEmpty() || Actor->GetClass()->GetName().Contains(ClassFilter);
+
+		if (bNameMatch && bClassMatch)
+		{
+			if (!FirstMatch)
+			{
+				FirstMatch = Actor;
+			}
+			MatchesArray.Add(MakeShareable(new FJsonValueObject(ActorToJson(Actor, true))));
+		}
+	}
+
+	if (!FirstMatch)
+	{
+		if (!Name.IsEmpty())
+		{
+			return MakeErrorResult(FString::Printf(TEXT("Actor not found: %s"), *Name));
+		}
+		return MakeErrorResult(FString::Printf(TEXT("No actors found for class filter: %s"), *ClassFilter));
+	}
+
 	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
 	Result->SetBoolField(TEXT("success"), true);
-	Result->SetObjectField(TEXT("actor"), ActorToJson(Actor, true));
-	
+	Result->SetObjectField(TEXT("actor"), ActorToJson(FirstMatch, true));
+	Result->SetNumberField(TEXT("count"), MatchesArray.Num());
+	Result->SetArrayField(TEXT("matches"), MatchesArray);
+	Result->SetStringField(TEXT("world"), World->GetName());
+
 	return Result;
 }
 
 TSharedPtr<FJsonObject> FOpenClawTools::Actor_GetAll(const TSharedPtr<FJsonObject>& Params)
 {
-	UWorld* World = GetEditorWorld();
+	UWorld* World = ResolveToolWorld(Params, true);
 	if (!World)
 	{
-		return MakeErrorResult(TEXT("No editor world"));
+		return MakeErrorResult(TEXT("No world available"));
 	}
-	
+
+	const FString ClassFilter = Params->HasField(TEXT("class")) ? Params->GetStringField(TEXT("class")) : TEXT("");
 	TArray<TSharedPtr<FJsonValue>> ActorsArray;
-	
+
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
 		AActor* Actor = *It;
 		if (Actor && !Actor->IsA<AWorldSettings>())
 		{
-			ActorsArray.Add(MakeShareable(new FJsonValueObject(ActorToJson(Actor, false))));
+			if (ClassFilter.IsEmpty() || Actor->GetClass()->GetName().Contains(ClassFilter))
+			{
+				ActorsArray.Add(MakeShareable(new FJsonValueObject(ActorToJson(Actor, false))));
+			}
 		}
 	}
 	
 	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
 	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("world"), World->GetName());
 	Result->SetNumberField(TEXT("count"), ActorsArray.Num());
 	Result->SetArrayField(TEXT("actors"), ActorsArray);
 	
@@ -1011,10 +1118,10 @@ TSharedPtr<FJsonObject> FOpenClawTools::Editor_GetState(const TSharedPtr<FJsonOb
 // Debug tools
 TSharedPtr<FJsonObject> FOpenClawTools::Debug_Hierarchy(const TSharedPtr<FJsonObject>& Params)
 {
-	UWorld* World = GetEditorWorld();
+	UWorld* World = ResolveToolWorld(Params, true);
 	if (!World)
 	{
-		return MakeErrorResult(TEXT("No editor world"));
+		return MakeErrorResult(TEXT("No world available"));
 	}
 	
 	int32 MaxDepth = Params->HasField(TEXT("depth")) ? Params->GetIntegerField(TEXT("depth")) : 10;
@@ -1153,60 +1260,159 @@ TSharedPtr<FJsonObject> FOpenClawTools::Asset_Import(const TSharedPtr<FJsonObjec
 // Console tools
 TSharedPtr<FJsonObject> FOpenClawTools::Console_Execute(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Command = Params->GetStringField(TEXT("command"));
-	
+	const FString Command = Params->HasField(TEXT("command")) ? Params->GetStringField(TEXT("command")) : TEXT("");
+
 	if (Command.IsEmpty())
 	{
 		return MakeErrorResult(TEXT("command is required"));
 	}
-	
+
 	if (GEngine)
 	{
-		UWorld* ExecWorld = (GEditor && GEditor->PlayWorld) ? GEditor->PlayWorld.Get() : GetEditorWorld();
+		UWorld* ExecWorld = ResolveToolWorld(Params, true);
 		if (!ExecWorld)
 		{
 			return MakeErrorResult(TEXT("No valid world for console execution"));
 		}
 
-		GEngine->Exec(ExecWorld, *Command);
-		return MakeSuccessResult(FString::Printf(TEXT("Executed: %s"), *Command));
+		const bool bExecResult = GEngine->Exec(ExecWorld, *Command);
+
+		TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+		Result->SetBoolField(TEXT("success"), bExecResult);
+		Result->SetBoolField(TEXT("execResult"), bExecResult);
+		Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Executed: %s"), *Command));
+		Result->SetStringField(TEXT("world"), ExecWorld->GetName());
+		return Result;
 	}
-	
+
 	return MakeErrorResult(TEXT("GEngine not available"));
 }
 
 TSharedPtr<FJsonObject> FOpenClawTools::Console_GetLogs(const TSharedPtr<FJsonObject>& Params)
 {
-	int32 Count = Params->HasField(TEXT("count")) ? Params->GetIntegerField(TEXT("count")) : 50;
-	FString Filter = Params->HasField(TEXT("filter")) ? Params->GetStringField(TEXT("filter")) : TEXT("");
-	
+	const int32 Count = Params->HasField(TEXT("count")) ? Params->GetIntegerField(TEXT("count")) : 50;
+	const FString Filter = Params->HasField(TEXT("filter")) ? Params->GetStringField(TEXT("filter")) : TEXT("");
+	const int32 Attempts = Params->HasField(TEXT("attempts")) ? FMath::Clamp(Params->GetIntegerField(TEXT("attempts")), 1, 10) : 3;
+	const float RetryDelaySeconds = Params->HasField(TEXT("retryDelayMs"))
+		? FMath::Clamp((float)Params->GetNumberField(TEXT("retryDelayMs")) / 1000.0f, 0.05f, 5.0f)
+		: 0.5f;
+
 	TArray<TSharedPtr<FJsonValue>> LogsArray;
-	
+	TArray<FString> LogLines;
+
+	const FString LogsDir = FPaths::ProjectLogDir();
+	const FString PreferredProjectLogPath = FPaths::ConvertRelativePathToFull(LogsDir / (FString(FApp::GetProjectName()) + TEXT(".log")));
+
+	auto BuildCandidatePaths = [&]() -> TArray<FString>
 	{
-		// Read from log file
-		FString ProjectLogPath = FPaths::ProjectLogDir() / FApp::GetProjectName() + TEXT(".log");
-		TArray<FString> LogLines;
-		if (FFileHelper::LoadFileToStringArray(LogLines, *ProjectLogPath))
+		TArray<FString> CandidatePaths;
+		TSet<FString> Seen;
+
+		auto AddCandidate = [&](const FString& InPath)
 		{
-			int32 StartIdx = FMath::Max(0, LogLines.Num() - Count);
-			for (int32 i = StartIdx; i < LogLines.Num(); i++)
+			if (InPath.IsEmpty())
 			{
-				if (Filter.IsEmpty() || LogLines[i].Contains(Filter))
-				{
-					TSharedPtr<FJsonObject> LogEntry = MakeShareable(new FJsonObject());
-					LogEntry->SetStringField(TEXT("message"), LogLines[i]);
-					LogEntry->SetNumberField(TEXT("line"), i + 1);
-					LogsArray.Add(MakeShareable(new FJsonValueObject(LogEntry)));
-				}
+				return;
+			}
+
+			const FString FullPath = FPaths::ConvertRelativePathToFull(InPath);
+			if (!Seen.Contains(FullPath))
+			{
+				CandidatePaths.Add(FullPath);
+				Seen.Add(FullPath);
+			}
+		};
+
+		AddCandidate(FPlatformOutputDevices::GetAbsoluteLogFilename());
+		AddCandidate(PreferredProjectLogPath);
+
+		TArray<FString> CandidateLogs;
+		IFileManager::Get().FindFiles(CandidateLogs, *(LogsDir / TEXT("*.log")), true, false);
+		CandidateLogs.Sort([&](const FString& A, const FString& B)
+		{
+			const FDateTime TimeA = IFileManager::Get().GetTimeStamp(*(LogsDir / A));
+			const FDateTime TimeB = IFileManager::Get().GetTimeStamp(*(LogsDir / B));
+			return TimeA > TimeB;
+		});
+
+		for (const FString& Candidate : CandidateLogs)
+		{
+			AddCandidate(LogsDir / Candidate);
+		}
+
+		return CandidatePaths;
+	};
+
+	FString SelectedLogPath;
+	int32 AttemptUsed = 0;
+
+	for (int32 Attempt = 1; Attempt <= Attempts; ++Attempt)
+	{
+		AttemptUsed = Attempt;
+
+		if (GLog)
+		{
+			GLog->FlushThreadedLogs();
+			GLog->Flush();
+		}
+
+		const TArray<FString> CandidatePaths = BuildCandidatePaths();
+		for (const FString& CandidatePath : CandidatePaths)
+		{
+			if (FPaths::FileExists(CandidatePath) && FFileHelper::LoadFileToStringArray(LogLines, *CandidatePath))
+			{
+				SelectedLogPath = CandidatePath;
+				break;
+			}
+		}
+
+		if (!SelectedLogPath.IsEmpty())
+		{
+			break;
+		}
+
+		if (Attempt < Attempts)
+		{
+			FPlatformProcess::Sleep(RetryDelaySeconds);
+		}
+	}
+
+	if (SelectedLogPath.IsEmpty())
+	{
+		return MakeErrorResult(FString::Printf(TEXT("Unable to read any log file after %d attempt(s) in %s"), Attempts, *LogsDir));
+	}
+
+	int32 Added = 0;
+	for (int32 i = LogLines.Num() - 1; i >= 0; --i)
+	{
+		if (Filter.IsEmpty() || LogLines[i].Contains(Filter))
+		{
+			TSharedPtr<FJsonObject> LogEntry = MakeShareable(new FJsonObject());
+			LogEntry->SetStringField(TEXT("message"), LogLines[i]);
+			LogEntry->SetNumberField(TEXT("line"), i + 1);
+			LogsArray.Insert(MakeShareable(new FJsonValueObject(LogEntry)), 0);
+			Added++;
+			if (Added >= Count)
+			{
+				break;
 			}
 		}
 	}
-	
+
+	const bool bUsedFallback = !PreferredProjectLogPath.IsEmpty() && SelectedLogPath != PreferredProjectLogPath;
+
 	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
 	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("logPath"), SelectedLogPath);
+	Result->SetStringField(TEXT("selectedFile"), FPaths::GetCleanFilename(SelectedLogPath));
+	Result->SetStringField(TEXT("preferredLogPath"), PreferredProjectLogPath);
+	Result->SetBoolField(TEXT("usedFallback"), bUsedFallback);
+	Result->SetStringField(TEXT("lastWriteTime"), IFileManager::Get().GetTimeStamp(*SelectedLogPath).ToString());
+	Result->SetNumberField(TEXT("attempts"), AttemptUsed);
+	Result->SetNumberField(TEXT("totalLines"), LogLines.Num());
 	Result->SetNumberField(TEXT("count"), LogsArray.Num());
 	Result->SetArrayField(TEXT("logs"), LogsArray);
-	
+
 	return Result;
 }
 
