@@ -833,6 +833,7 @@ TSharedPtr<FJsonObject> FOpenClawTools::Actor_CallFunction(const TSharedPtr<FJso
 		}
 
 		void* PropAddr = Prop->ContainerPtrToValuePtr<void>(Parms.GetData());
+		Result->SetStringField(TEXT("returnType"), Prop->GetClass()->GetName());
 
 		if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
 		{
@@ -853,6 +854,35 @@ TSharedPtr<FJsonObject> FOpenClawTools::Actor_CallFunction(const TSharedPtr<FJso
 		else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
 		{
 			Result->SetStringField(TEXT("returnValue"), StrProp->GetPropertyValue(PropAddr));
+		}
+		else if (FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+		{
+			Result->SetStringField(TEXT("returnValue"), NameProp->GetPropertyValue(PropAddr).ToString());
+		}
+		else if (FObjectPropertyBase* ObjectProp = CastField<FObjectPropertyBase>(Prop))
+		{
+			if (UObject* ReturnObject = ObjectProp->GetObjectPropertyValue(PropAddr))
+			{
+				TSharedPtr<FJsonObject> ReturnObjectInfo = MakeShareable(new FJsonObject());
+				ReturnObjectInfo->SetStringField(TEXT("name"), ReturnObject->GetName());
+				ReturnObjectInfo->SetStringField(TEXT("class"), ReturnObject->GetClass()->GetName());
+				ReturnObjectInfo->SetStringField(TEXT("path"), ReturnObject->GetPathName());
+
+				if (AActor* ReturnActor = Cast<AActor>(ReturnObject))
+				{
+					ReturnObjectInfo->SetStringField(TEXT("label"), ReturnActor->GetActorLabel());
+				}
+
+				Result->SetObjectField(TEXT("returnValue"), ReturnObjectInfo);
+			}
+			else
+			{
+				Result->SetNullField(TEXT("returnValue"));
+			}
+		}
+		else
+		{
+			Result->SetStringField(TEXT("returnValueUnsupported"), Prop->GetCPPType());
 		}
 		break;
 	}
