@@ -877,7 +877,7 @@ TSharedPtr<FJsonObject> FOpenClawTools::Actor_CallFunction(const TSharedPtr<FJso
 			}
 			else
 			{
-				Result->SetNullField(TEXT("returnValue"));
+				Result->SetField(TEXT("returnValue"), MakeShareable(new FJsonValueNull()));
 			}
 		}
 		else
