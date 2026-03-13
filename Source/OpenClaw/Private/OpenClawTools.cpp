@@ -1323,8 +1323,9 @@ TSharedPtr<FJsonObject> FOpenClawTools::Console_GetLogs(const TSharedPtr<FJsonOb
 			}
 		};
 
-		AddCandidate(FPlatformOutputDevices::GetAbsoluteLogFilename());
+		// Prefer the active project log first; platform absolute log can point at backup rotations.
 		AddCandidate(PreferredProjectLogPath);
+		AddCandidate(FPlatformOutputDevices::GetAbsoluteLogFilename());
 
 		TArray<FString> CandidateLogs;
 		IFileManager::Get().FindFiles(CandidateLogs, *(LogsDir / TEXT("*.log")), true, false);
