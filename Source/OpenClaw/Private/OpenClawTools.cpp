@@ -1375,6 +1375,7 @@ TSharedPtr<FJsonObject> FOpenClawTools::Console_GetLogs(const TSharedPtr<FJsonOb
 	};
 
 	FString SelectedLogPath;
+	FDateTime SelectedTimestamp = FDateTime::MinValue();
 	int32 AttemptUsed = 0;
 
 	for (int32 Attempt = 1; Attempt <= Attempts; ++Attempt)
@@ -1388,17 +1389,49 @@ TSharedPtr<FJsonObject> FOpenClawTools::Console_GetLogs(const TSharedPtr<FJsonOb
 		}
 
 		const TArray<FString> CandidatePaths = BuildCandidatePaths();
+		FString BestPathForAttempt;
+		FDateTime BestTimestampForAttempt = FDateTime::MinValue();
+		TArray<FString> BestLinesForAttempt;
+
 		for (const FString& CandidatePath : CandidatePaths)
 		{
-			if (FPaths::FileExists(CandidatePath) && FFileHelper::LoadFileToStringArray(LogLines, *CandidatePath))
+			if (!FPaths::FileExists(CandidatePath))
 			{
-				SelectedLogPath = CandidatePath;
-				break;
+				continue;
+			}
+
+			TArray<FString> CandidateLines;
+			bool bLoaded = FFileHelper::LoadFileToStringArray(CandidateLines, *CandidatePath);
+			if (!bLoaded)
+			{
+				// Fallback for actively-written log files that may require shared read access.
+				FString RawLog;
+				bLoaded = FFileHelper::LoadFileToString(RawLog, *CandidatePath, FFileHelper::EHashOptions::None, FILEREAD_AllowWrite);
+				if (bLoaded)
+				{
+					RawLog.ParseIntoArrayLines(CandidateLines, true);
+				}
+			}
+
+			if (!bLoaded)
+			{
+				continue;
+			}
+
+			const FDateTime CandidateTimestamp = IFileManager::Get().GetTimeStamp(*CandidatePath);
+			if (BestPathForAttempt.IsEmpty() || CandidateTimestamp > BestTimestampForAttempt)
+			{
+				BestPathForAttempt = CandidatePath;
+				BestTimestampForAttempt = CandidateTimestamp;
+				BestLinesForAttempt = MoveTemp(CandidateLines);
 			}
 		}
 
-		if (!SelectedLogPath.IsEmpty())
+		if (!BestPathForAttempt.IsEmpty())
 		{
+			SelectedLogPath = BestPathForAttempt;
+			SelectedTimestamp = BestTimestampForAttempt;
+			LogLines = MoveTemp(BestLinesForAttempt);
 			break;
 		}
 
@@ -1431,6 +1464,11 @@ TSharedPtr<FJsonObject> FOpenClawTools::Console_GetLogs(const TSharedPtr<FJsonOb
 	}
 
 	const bool bUsedFallback = !PreferredProjectLogPath.IsEmpty() && SelectedLogPath != PreferredProjectLogPath;
+	const FDateTime EffectiveTimestamp = SelectedTimestamp != FDateTime::MinValue()
+		? SelectedTimestamp
+		: IFileManager::Get().GetTimeStamp(*SelectedLogPath);
+	const double AgeSeconds = FMath::Max(0.0, (FDateTime::UtcNow() - EffectiveTimestamp).GetTotalSeconds());
+	const bool bIsLiveCandidate = AgeSeconds <= 30.0;
 
 	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
 	Result->SetBoolField(TEXT("success"), true);
@@ -1438,7 +1476,10 @@ TSharedPtr<FJsonObject> FOpenClawTools::Console_GetLogs(const TSharedPtr<FJsonOb
 	Result->SetStringField(TEXT("selectedFile"), FPaths::GetCleanFilename(SelectedLogPath));
 	Result->SetStringField(TEXT("preferredLogPath"), PreferredProjectLogPath);
 	Result->SetBoolField(TEXT("usedFallback"), bUsedFallback);
-	Result->SetStringField(TEXT("lastWriteTime"), IFileManager::Get().GetTimeStamp(*SelectedLogPath).ToString());
+	Result->SetStringField(TEXT("selectionReason"), TEXT("newest-timestamp"));
+	Result->SetBoolField(TEXT("isLiveCandidate"), bIsLiveCandidate);
+	Result->SetNumberField(TEXT("logAgeSeconds"), AgeSeconds);
+	Result->SetStringField(TEXT("lastWriteTime"), EffectiveTimestamp.ToString());
 	Result->SetNumberField(TEXT("attempts"), AttemptUsed);
 	Result->SetNumberField(TEXT("totalLines"), LogLines.Num());
 	Result->SetNumberField(TEXT("count"), LogsArray.Num());
